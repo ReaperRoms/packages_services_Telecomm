@@ -155,6 +155,7 @@ public class ParcelableCallUtils {
                 capabilities,
                 properties,
                 connectTimeMillis,
+                call.getCreationTimeMillis(),
                 handle,
                 call.getHandlePresentation(),
                 callerDisplayName,
@@ -316,9 +317,6 @@ public class ParcelableCallUtils {
 
         Connection.PROPERTY_GENERIC_CONFERENCE,
         android.telecom.Call.Details.PROPERTY_GENERIC_CONFERENCE,
-
-        Connection.PROPERTY_SHOW_CALLBACK_NUMBER,
-        android.telecom.Call.Details.PROPERTY_EMERGENCY_CALLBACK_MODE,
 
         Connection.PROPERTY_IS_EXTERNAL_CALL,
         android.telecom.Call.Details.PROPERTY_IS_EXTERNAL_CALL,
