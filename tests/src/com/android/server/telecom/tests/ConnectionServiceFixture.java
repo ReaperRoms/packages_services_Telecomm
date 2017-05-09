@@ -336,6 +336,7 @@ public class ConnectionServiceFixture implements TestFixture<IConnectionService>
         int addressPresentation;
         int capabilities;
         int properties;
+        int supportedAudioRoutes;
         StatusHints statusHints;
         DisconnectCause disconnectCause;
         String conferenceId;
@@ -437,6 +438,11 @@ public class ConnectionServiceFixture implements TestFixture<IConnectionService>
         }
     }
 
+    public void sendSetConnectionProperties(String id) throws Exception {
+        for (IConnectionServiceAdapter a : mConnectionServiceAdapters) {
+            a.setConnectionProperties(id, mConnectionById.get(id).properties);
+        }
+    }
     public void sendSetIsConferenced(String id) throws Exception {
         for (IConnectionServiceAdapter a : mConnectionServiceAdapters) {
             a.setIsConferenced(id, mConnectionById.get(id).conferenceId);
@@ -592,6 +598,7 @@ public class ConnectionServiceFixture implements TestFixture<IConnectionService>
                 c.state,
                 c.capabilities,
                 c.properties,
+                c.supportedAudioRoutes,
                 c.request.getAddress(),
                 c.addressPresentation,
                 c.callerDisplayName,

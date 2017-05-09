@@ -88,6 +88,8 @@ public class ParcelableCallUtils {
         }
         int capabilities = convertConnectionToCallCapabilities(call.getConnectionCapabilities());
         int properties = convertConnectionToCallProperties(call.getConnectionProperties());
+        int supportedAudioRoutes = call.getSupportedAudioRoutes();
+
         if (call.isConference()) {
             properties |= android.telecom.Call.Details.PROPERTY_CONFERENCE;
         }
@@ -96,7 +98,10 @@ public class ParcelableCallUtils {
             properties |= android.telecom.Call.Details.PROPERTY_ENTERPRISE_CALL;
         }
 
-        if (call.isRespondViaSmsCapable()) {
+        // If this is a single-SIM device, the "default SIM" will always be the only SIM.
+        boolean isDefaultSmsAccount = phoneAccountRegistrar != null &&
+                phoneAccountRegistrar.isUserSelectedSmsPhoneAccount(call.getTargetPhoneAccount());
+        if (call.isRespondViaSmsCapable() && isDefaultSmsAccount) {
             capabilities |= android.telecom.Call.Details.CAPABILITY_RESPOND_VIA_TEXT;
         }
 
@@ -154,6 +159,7 @@ public class ParcelableCallUtils {
                 call.getCannedSmsResponses(),
                 capabilities,
                 properties,
+                supportedAudioRoutes,
                 connectTimeMillis,
                 call.getCreationTimeMillis(),
                 handle,
@@ -317,6 +323,9 @@ public class ParcelableCallUtils {
 
         Connection.PROPERTY_GENERIC_CONFERENCE,
         android.telecom.Call.Details.PROPERTY_GENERIC_CONFERENCE,
+
+        Connection.PROPERTY_EMERGENCY_CALLBACK_MODE,
+        android.telecom.Call.Details.PROPERTY_EMERGENCY_CALLBACK_MODE,
 
         Connection.PROPERTY_IS_EXTERNAL_CALL,
         android.telecom.Call.Details.PROPERTY_IS_EXTERNAL_CALL,

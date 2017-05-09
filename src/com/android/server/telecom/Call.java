@@ -26,6 +26,8 @@ import android.os.Looper;
 import android.os.RemoteException;
 import android.os.Trace;
 import android.provider.ContactsContract.Contacts;
+import android.telecom.CallAudioState;
+import android.telecom.Conference;
 import android.telecom.DisconnectCause;
 import android.telecom.Connection;
 import android.telecom.GatewayInfo;
@@ -108,7 +110,7 @@ public class Call implements CreateConnectionResponse {
         void onConnectionManagerPhoneAccountChanged(Call call);
         void onPhoneAccountChanged(Call call);
         void onConferenceableCallsChanged(Call call);
-        boolean onCanceledViaNewOutgoingCallBroadcast(Call call);
+        boolean onCanceledViaNewOutgoingCallBroadcast(Call call, long disconnectionTimeout);
         void onHoldToneRequested(Call call);
         void onConnectionEvent(Call call, String event, Bundle extras);
         void onExternalCallChanged(Call call, boolean isExternalCall);
@@ -170,7 +172,7 @@ public class Call implements CreateConnectionResponse {
         @Override
         public void onConferenceableCallsChanged(Call call) {}
         @Override
-        public boolean onCanceledViaNewOutgoingCallBroadcast(Call call) {
+        public boolean onCanceledViaNewOutgoingCallBroadcast(Call call, long disconnectionTimeout) {
             return false;
         }
 
@@ -320,6 +322,8 @@ public class Call implements CreateConnectionResponse {
 
     private int mConnectionProperties;
 
+    private int mSupportedAudioRoutes = CallAudioState.ROUTE_ALL;
+
     private boolean mIsConference = false;
 
     private final boolean mShouldAttachToExistingConnection;
@@ -383,6 +387,17 @@ public class Call implements CreateConnectionResponse {
     private boolean mIsVideoCallingSupported = false;
 
     private PhoneNumberUtilsAdapter mPhoneNumberUtilsAdapter;
+
+    /**
+     * For {@link Connection}s or {@link android.telecom.Conference}s added via a ConnectionManager
+     * using the {@link android.telecom.ConnectionService#addExistingConnection(PhoneAccountHandle,
+     * Connection)} or {@link android.telecom.ConnectionService#addConference(Conference)},
+     * indicates the ID of this call as it was referred to by the {@code ConnectionService} which
+     * originally created it.
+     *
+     * See {@link Connection#EXTRA_ORIGINAL_CONNECTION_ID} for more information.
+     */
+    private String mOriginalConnectionId;
 
     /**
      * Persists the specified parameters and initializes the new instance.
@@ -1065,12 +1080,24 @@ public class Call implements CreateConnectionResponse {
 
             }
 
+            mAnalytics.addCallProperties(mConnectionProperties);
+
             int xorProps = previousProperties ^ mConnectionProperties;
             Log.event(this, Log.Events.PROPERTY_CHANGE,
                     "Current: [%s], Removed [%s], Added [%s]",
                     Connection.propertiesToStringShort(mConnectionProperties),
                     Connection.propertiesToStringShort(previousProperties & xorProps),
                     Connection.propertiesToStringShort(mConnectionProperties & xorProps));
+        }
+    }
+
+    public int getSupportedAudioRoutes() {
+        return mSupportedAudioRoutes;
+    }
+
+    void setSupportedAudioRoutes(int audioRoutes) {
+        if (mSupportedAudioRoutes != audioRoutes) {
+            mSupportedAudioRoutes = audioRoutes;
         }
     }
 
@@ -1125,6 +1152,34 @@ public class Call implements CreateConnectionResponse {
     }
 
     /**
+     * Perform an in-place replacement of the {@link ConnectionServiceWrapper} for this Call.
+     * Removes the call from its former {@link ConnectionServiceWrapper}, ensuring that the
+     * ConnectionService is NOT unbound if the call count hits zero.
+     * This is used by the {@link ConnectionServiceWrapper} when handling {@link Connection} and
+     * {@link Conference} additions via a ConnectionManager.
+     * The original {@link android.telecom.ConnectionService} will directly add external calls and
+     * conferences to Telecom as well as the ConnectionManager, which will add to Telecom.  In these
+     * cases since its first added to via the original CS, we want to change the CS responsible for
+     * the call to the ConnectionManager rather than adding it again as another call/conference.
+     *
+     * @param service The new {@link ConnectionServiceWrapper}.
+     */
+    public void replaceConnectionService(ConnectionServiceWrapper service) {
+        Preconditions.checkNotNull(service);
+
+        if (mConnectionService != null) {
+            ConnectionServiceWrapper serviceTemp = mConnectionService;
+            mConnectionService = null;
+            serviceTemp.removeCall(this);
+            serviceTemp.decrementAssociatedCallCount(true /*isSuppressingUnbind*/);
+        }
+
+        service.incrementAssociatedCallCount();
+        mConnectionService = service;
+        mAnalytics.setCallConnectionService(service.getComponentName().flattenToShortString());
+    }
+
+    /**
      * Clears the associated connection service.
      */
     void clearConnectionService() {
@@ -1174,6 +1229,7 @@ public class Call implements CreateConnectionResponse {
 
         setConnectionCapabilities(connection.getConnectionCapabilities());
         setConnectionProperties(connection.getConnectionProperties());
+        setSupportedAudioRoutes(connection.getSupportedAudioRoutes());
         setVideoProvider(connection.getVideoProvider());
         setVideoState(connection.getVideoState());
         setRingbackRequested(connection.isRingbackRequested());
@@ -1275,14 +1331,14 @@ public class Call implements CreateConnectionResponse {
 
     @VisibleForTesting
     public void disconnect() {
-        disconnect(false);
+        disconnect(0);
     }
 
     /**
      * Attempts to disconnect the call through the connection service.
      */
     @VisibleForTesting
-    public void disconnect(boolean wasViaNewOutgoingCallBroadcaster) {
+    public void disconnect(long disconnectionTimeout) {
         Log.event(this, Log.Events.REQUEST_DISCONNECT);
 
         // Track that the call is now locally disconnecting.
@@ -1291,7 +1347,7 @@ public class Call implements CreateConnectionResponse {
         if (mState == CallState.NEW || mState == CallState.SELECT_PHONE_ACCOUNT ||
                 mState == CallState.CONNECTING) {
             Log.v(this, "Aborting call %s", this);
-            abort(wasViaNewOutgoingCallBroadcaster);
+            abort(disconnectionTimeout);
         } else if (mState != CallState.ABORTED && mState != CallState.DISCONNECTED) {
             if (mConnectionService == null) {
                 Log.e(this, new Exception(), "disconnect() request on a call without a"
@@ -1307,22 +1363,25 @@ public class Call implements CreateConnectionResponse {
         }
     }
 
-    void abort(boolean wasViaNewOutgoingCallBroadcaster) {
+    void abort(long disconnectionTimeout) {
         if (mCreateConnectionProcessor != null &&
                 !mCreateConnectionProcessor.isProcessingComplete()) {
             mCreateConnectionProcessor.abort();
         } else if (mState == CallState.NEW || mState == CallState.SELECT_PHONE_ACCOUNT
                 || mState == CallState.CONNECTING) {
-            if (wasViaNewOutgoingCallBroadcaster) {
-                // If the cancelation was from NEW_OUTGOING_CALL, then we do not automatically
-                // destroy the call.  Instead, we announce the cancelation and CallsManager handles
+            if (disconnectionTimeout > 0) {
+                // If the cancelation was from NEW_OUTGOING_CALL with a timeout of > 0
+                // milliseconds, do not destroy the call.
+                // Instead, we announce the cancellation and CallsManager handles
                 // it through a timer. Since apps often cancel calls through NEW_OUTGOING_CALL and
                 // then re-dial them quickly using a gateway, allowing the first call to end
                 // causes jank. This timeout allows CallsManager to transition the first call into
                 // the second call so that in-call only ever sees a single call...eliminating the
-                // jank altogether.
+                // jank altogether. The app will also be able to set the timeout via an extra on
+                // the ordered broadcast.
                 for (Listener listener : mListeners) {
-                    if (listener.onCanceledViaNewOutgoingCallBroadcast(this)) {
+                    if (listener.onCanceledViaNewOutgoingCallBroadcast(
+                            this, disconnectionTimeout)) {
                         // The first listener to handle this wins. A return value of true means that
                         // the listener will handle the disconnection process later and so we
                         // should not continue it here.
@@ -1345,8 +1404,6 @@ public class Call implements CreateConnectionResponse {
      */
     @VisibleForTesting
     public void answer(int videoState) {
-        Preconditions.checkNotNull(mConnectionService);
-
         // Check to verify that the call is still in the ringing state. A call can change states
         // between the time the user hits 'answer' and Telecom receives the command.
         if (isRinging("answer")) {
@@ -1359,7 +1416,12 @@ public class Call implements CreateConnectionResponse {
             // that it will work. Instead, we wait until confirmation from the connectino service
             // that the call is in a non-STATE_RINGING state before changing the UI. See
             // {@link ConnectionServiceAdapter#setActive} and other set* methods.
-            mConnectionService.answer(this, videoState);
+            if (mConnectionService != null) {
+                mConnectionService.answer(this, videoState);
+            } else {
+                Log.e(this, new NullPointerException(),
+                        "answer call failed due to null CS callId=%s", getId());
+            }
             Log.event(this, Log.Events.REQUEST_ACCEPT);
         }
     }
@@ -1372,16 +1434,20 @@ public class Call implements CreateConnectionResponse {
      */
     @VisibleForTesting
     public void reject(boolean rejectWithMessage, String textMessage) {
-        Preconditions.checkNotNull(mConnectionService);
-
         // Check to verify that the call is still in the ringing state. A call can change states
         // between the time the user hits 'reject' and Telecomm receives the command.
         if (isRinging("reject")) {
             // Ensure video state history tracks video state at time of rejection.
             mVideoStateHistory |= mVideoState;
 
-            mConnectionService.reject(this, rejectWithMessage, textMessage);
+            if (mConnectionService != null) {
+                mConnectionService.reject(this, rejectWithMessage, textMessage);
+            } else {
+                Log.e(this, new NullPointerException(),
+                        "reject call failed due to null CS callId=%s", getId());
+            }
             Log.event(this, Log.Events.REQUEST_REJECT);
+
         }
     }
 
@@ -1389,10 +1455,13 @@ public class Call implements CreateConnectionResponse {
      * Puts the call on hold if it is currently active.
      */
     void hold() {
-        Preconditions.checkNotNull(mConnectionService);
-
         if (mState == CallState.ACTIVE) {
-            mConnectionService.hold(this);
+            if (mConnectionService != null) {
+                mConnectionService.hold(this);
+            } else {
+                Log.e(this, new NullPointerException(),
+                        "hold call failed due to null CS callId=%s", getId());
+            }
             Log.event(this, Log.Events.REQUEST_HOLD);
             if (getParentCall() != null) {
                 mIsHoldInConference = true;
@@ -1404,10 +1473,13 @@ public class Call implements CreateConnectionResponse {
      * Releases the call from hold if it is currently active.
      */
     void unhold() {
-        Preconditions.checkNotNull(mConnectionService);
-
         if (mState == CallState.ON_HOLD) {
-            mConnectionService.unhold(this);
+            if (mConnectionService != null) {
+                mConnectionService.unhold(this);
+            } else {
+                Log.e(this, new NullPointerException(),
+                        "unhold call failed due to null CS callId=%s", getId());
+            }
             Log.event(this, Log.Events.REQUEST_UNHOLD);
             mIsHoldInConference = false;
         }
@@ -1462,7 +1534,12 @@ public class Call implements CreateConnectionResponse {
 
         // If the change originated from an InCallService, notify the connection service.
         if (source == SOURCE_INCALL_SERVICE) {
-            mConnectionService.onExtrasChanged(this, mExtras);
+            if (mConnectionService != null) {
+                mConnectionService.onExtrasChanged(this, mExtras);
+            } else {
+                Log.e(this, new NullPointerException(),
+                        "putExtras failed due to null CS callId=%s", getId());
+            }
         }
     }
 
@@ -1492,7 +1569,12 @@ public class Call implements CreateConnectionResponse {
 
         // If the change originated from an InCallService, notify the connection service.
         if (source == SOURCE_INCALL_SERVICE) {
-            mConnectionService.onExtrasChanged(this, mExtras);
+            if (mConnectionService != null) {
+                mConnectionService.onExtrasChanged(this, mExtras);
+            } else {
+                Log.e(this, new NullPointerException(),
+                        "removeExtras failed due to null CS callId=%s", getId());
+            }
         }
     }
 
@@ -1533,7 +1615,12 @@ public class Call implements CreateConnectionResponse {
     }
 
     void postDialContinue(boolean proceed) {
-        mConnectionService.onPostDialContinue(this, proceed);
+        if (mConnectionService != null) {
+            mConnectionService.onPostDialContinue(this, proceed);
+        } else {
+            Log.e(this, new NullPointerException(),
+                    "postDialContinue failed due to null CS callId=%s", getId());
+        }
     }
 
     void conferenceWith(Call otherCall) {
@@ -1643,7 +1730,12 @@ public class Call implements CreateConnectionResponse {
      * @param extras Associated extras.
      */
     public void sendCallEvent(String event, Bundle extras) {
-        mConnectionService.sendCallEvent(this, event, extras);
+        if (mConnectionService != null) {
+            mConnectionService.sendCallEvent(this, event, extras);
+        } else {
+            Log.e(this, new NullPointerException(),
+                    "sendCallEvent failed due to null CS callId=%s", getId());
+        }
     }
 
     void setParentCall(Call parentCall) {
@@ -1825,6 +1917,10 @@ public class Call implements CreateConnectionResponse {
      */
     private void setCallerInfo(Uri handle, CallerInfo callerInfo) {
         Trace.beginSection("setCallerInfo");
+        if (callerInfo == null) {
+            Log.i(this, "CallerInfo lookup returned null, skipping update");
+            return;
+        }
 
         if ((handle != null) && !handle.equals(mHandle)) {
             Log.i(this, "setCallerInfo received stale caller info for an old handle. Ignoring.");
@@ -2142,6 +2238,7 @@ public class Call implements CreateConnectionResponse {
      * @param extras The extras.
      */
     public void onConnectionEvent(String event, Bundle extras) {
+        Log.event(this, Log.Events.CONNECTION_EVENT, event);
         if (Connection.EVENT_ON_HOLD_TONE_START.equals(event)) {
             mIsRemotelyHeld = true;
             Log.event(this, Log.Events.REMOTELY_HELD);
@@ -2161,6 +2258,24 @@ public class Call implements CreateConnectionResponse {
                 l.onConnectionEvent(this, event, extras);
             }
         }
+    }
+
+    public void setOriginalConnectionId(String originalConnectionId) {
+        mOriginalConnectionId = originalConnectionId;
+    }
+
+    /**
+     * For calls added via a ConnectionManager using the
+     * {@link android.telecom.ConnectionService#addExistingConnection(PhoneAccountHandle,
+     * Connection)}, or {@link android.telecom.ConnectionService#addConference(Conference)} APIS,
+     * indicates the ID of this call as it was referred to by the {@code ConnectionService} which
+     * originally created it.
+     *
+     * See {@link Connection#EXTRA_ORIGINAL_CONNECTION_ID}.
+     * @return The original connection ID.
+     */
+    public String getOriginalConnectionId() {
+        return mOriginalConnectionId;
     }
 
     /**
